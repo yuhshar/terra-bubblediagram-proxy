@@ -4,17 +4,19 @@ api/bubble_endpoint.py
 FastAPI route: POST /api/bubble-diagram
 
 Pipeline:
-  1. parse_pdf_page()       — extract vector geometry
-  2. generate_markups()     — AI room markup proposals
-  3. render_markup_overlay() — bake markups into PDF
+  1. parse_pdf_page()        -- extract vector geometry + plan bounding box
+  2. generate_markups()      -- AI markup proposals (reconfigure bubbles + comment annotations)
+  3. render_markup_overlay() -- bake onto PDF as two sheets:
+                                Sheet 1: annotated plan (all markups)
+                                Sheet 2: reconfiguration study (reconfig bubbles only)
 
 Request:  multipart/form-data
   - file:          PDF file upload
   - page_index:    int (default 0)
   - unit_label:    str e.g. "3BR / 3.5BA"
-  - system_prompt: str (optional Terra project standards)
+  - system_prompt: str (optional Terra project standards override)
 
-Response: PDF file (application/pdf)
+Response: PDF file (application/pdf), 1 or 2 pages
 """
 
 import os
@@ -31,8 +33,8 @@ from utils.pdf_to_image import render_page_to_jpeg_b64
 
 app = FastAPI(
     title="Terra Markup Service",
-    description="Schematic markup PDF generator",
-    version="2.0.0",
+    description="Schematic markup PDF generator — annotated plan + reconfiguration study",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -63,7 +65,7 @@ async def bubble_diagram(
         raise HTTPException(400, "Not a valid PDF")
 
     try:
-        # Step 1: Parse vector geometry
+        # Step 1: Parse vector geometry (includes plan_bbox)
         geo = parse_pdf_page(pdf_bytes, page_index=page_index)
 
         if not geo.rooms:
@@ -72,7 +74,7 @@ async def bubble_diagram(
         # Step 2: Render page to JPEG for AI vision
         plan_image_b64 = render_page_to_jpeg_b64(pdf_bytes, page_index=page_index)
 
-        # Step 3: AI markup proposals
+        # Step 3: AI markup proposals (reconfigure + comment types)
         proposal = await generate_markups(
             geo=geo,
             plan_image_b64=plan_image_b64,
@@ -84,7 +86,7 @@ async def bubble_diagram(
         if not proposal.markups:
             raise HTTPException(422, "AI returned no markup proposals")
 
-        # Step 4: Render overlay onto PDF
+        # Step 4: Render overlay onto PDF (1 or 2 sheets)
         output_pdf = render_markup_overlay(
             original_pdf_bytes=pdf_bytes,
             proposal=proposal,
@@ -100,6 +102,10 @@ async def bubble_diagram(
     except Exception as e:
         raise HTTPException(500, f"Pipeline error: {type(e).__name__}: {e}")
 
+    reconfig_count = sum(1 for m in proposal.markups if not m.is_comment)
+    comment_count  = sum(1 for m in proposal.markups if m.is_comment)
+    sheet_count    = 2 if reconfig_count > 0 else 1
+
     filename = f"Terra_Markup_{unit_label.replace('/', '-').replace(' ', '_') or 'unit'}.pdf"
     return Response(
         content=output_pdf,
@@ -107,6 +113,9 @@ async def bubble_diagram(
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Terra-Markups-Count": str(len(proposal.markups)),
+            "X-Terra-Reconfig-Count": str(reconfig_count),
+            "X-Terra-Comment-Count": str(comment_count),
+            "X-Terra-Sheet-Count": str(sheet_count),
             "X-Terra-Summary": proposal.summary[:200],
         },
     )
@@ -127,6 +136,7 @@ async def parse_only(
         "page_width": geo.page_width,
         "page_height": geo.page_height,
         "plan_angle_deg": geo.plan_angle_deg,
+        "plan_bbox": geo.plan_bbox,
         "unit_type": geo.unit_type,
         "unit_area_sqft": geo.unit_area_sqft,
         "rooms_detected": len(geo.rooms),
@@ -145,4 +155,4 @@ async def parse_only(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "terra-markup-v2"}
+    return {"status": "ok", "service": "terra-markup-v3"}
