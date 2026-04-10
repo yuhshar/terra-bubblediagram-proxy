@@ -1,0 +1,28 @@
+# Terra Bubble Diagram Service — Dependencies
+
+# Web framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9       # required for FastAPI file uploads
+
+# PDF parsing (Step 1)
+pdfplumber>=0.10.0
+pypdf>=4.0.0
+
+# AI API client (Step 2)
+httpx>=0.27.0
+
+# PDF rendering (Step 3)
+reportlab>=4.1.0
+
+# Image rendering for AI vision call
+pdf2image>=1.17.0             # requires poppler system package
+Pillow>=10.0.0
+
+# Optional fallback image renderer (if poppler unavailable)
+# pymupdf>=1.24.0             # uncomment if using PyMuPDF instead
+
+# Dev / testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx                         # also used for test client
