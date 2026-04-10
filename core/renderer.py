@@ -3,21 +3,14 @@ core/renderer.py
 ----------------
 Step 3: PDF Markup Renderer
 
-Takes the original vector PDF + ReconfigurationProposal and produces
-a new PDF with semi-transparent polygonal bubble diagrams baked in as
-a vector overlay layer.
+Draws on each marked-up room:
+  1. Semi-transparent colored fill over the room bbox
+  2. Stroke border (same color, higher opacity)
+  3. Inside label — room name centered in the fill, rotated to plan angle
+  4. Leader line — from room centroid toward callout direction
+  5. Callout text — at end of leader line, uppercase, colored
 
-Rendering approach:
-  - Uses reportlab to draw bubbles onto a transparent overlay PDF page
-  - Uses pypdf to merge the overlay onto the original plan page
-  - Preserves all original vector geometry underneath
-
-Bubble visual style:
-  - Semi-transparent filled polygons (angular vertices, NOT ellipses)
-  - Colored stroke outline at higher opacity
-  - Rotated room name label centered in each bubble
-  - Optional note text below label in smaller font
-  - A legend panel in the margin listing all room types
+Merges overlay onto original vector PDF page using pypdf.
 """
 
 import io
@@ -27,248 +20,243 @@ from typing import Optional
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import Color
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 
-
-from core.layout_engine import ReconfigurationProposal, BubblePolygon
-
-
-# ─── Font Setup ───────────────────────────────────────────────────────────────
-
-# Use Helvetica (built-in, always available) — clean sans-serif for diagrams
-LABEL_FONT = "Helvetica-Bold"
-NOTE_FONT = "Helvetica"
-LEGEND_FONT = "Helvetica"
+from core.layout_engine import MarkupProposal, RoomMarkup
 
 
 # ─── Drawing Helpers ──────────────────────────────────────────────────────────
 
-def _draw_angular_polygon(
+def _draw_room_fill(
     c: canvas.Canvas,
-    points: list[tuple[float, float]],
-    fill_rgb: tuple,
-    fill_opacity: float,
-    stroke_rgb: tuple,
-    stroke_opacity: float = 0.85,
-    stroke_width: float = 1.4,
+    markup: RoomMarkup,
 ):
-    """
-    Draw a filled + stroked polygon with angular vertices.
-    Uses reportlab's path API for crisp vector output.
-    """
-    if len(points) < 3:
+    """Draw semi-transparent filled rectangle over the room."""
+    if not markup.bbox:
         return
+    x0, y0, x1, y1 = markup.bbox
+    w = x1 - x0
+    h = y1 - y0
 
-    # Fill pass
-    fill_color = Color(fill_rgb[0], fill_rgb[1], fill_rgb[2], alpha=fill_opacity)
-    stroke_color = Color(stroke_rgb[0], stroke_rgb[1], stroke_rgb[2], alpha=stroke_opacity)
-
-    p = c.beginPath()
-    p.moveTo(points[0][0], points[0][1])
-    for px, py in points[1:]:
-        p.lineTo(px, py)
-    p.close()
+    fill = Color(*markup.fill_color, alpha=markup.fill_opacity)
+    stroke = Color(*markup.stroke_color, alpha=0.88)
 
     c.saveState()
-    c.setFillColor(fill_color)
-    c.setStrokeColor(stroke_color)
-    c.setLineWidth(stroke_width)
-    c.setLineJoin(0)   # miter join — sharp angular corners
-    c.drawPath(p, fill=1, stroke=1)
+    c.setFillColor(fill)
+    c.setStrokeColor(stroke)
+    c.setLineWidth(1.5)
+    c.rect(x0, y0, w, h, fill=1, stroke=1)
     c.restoreState()
 
 
-def _draw_bubble_label(
+def _draw_inside_label(
     c: canvas.Canvas,
-    bubble: BubblePolygon,
-    page_height: float,
+    markup: RoomMarkup,
+    plan_angle_deg: float,
 ):
-    """
-    Draw room name label centered in the bubble, rotated to plan angle.
-    Optionally draws a smaller note below the room name.
-    """
-    lx = bubble.label_x
-    ly = bubble.label_y
-    angle = bubble.label_angle
+    """Draw room name centered inside the fill, rotated to plan angle."""
+    if not markup.bbox:
+        return
 
-    # Compute font size relative to bubble area
-    xs = [p[0] for p in bubble.points]
-    ys = [p[1] for p in bubble.points]
-    approx_w = max(xs) - min(xs)
-    approx_h = max(ys) - min(ys)
-    approx_diag = math.hypot(approx_w, approx_h)
-    label_fs = max(6.5, min(11.0, approx_diag * 0.095))
-    note_fs = max(5.5, label_fs * 0.72)
+    x0, y0, x1, y1 = markup.bbox
+    cx = (x0 + x1) / 2
+    cy = (y0 + y1) / 2
+    box_w = abs(x1 - x0)
+    box_h = abs(y1 - y0)
+
+    # Font size relative to box size
+    fs = max(6.0, min(10.0, min(box_w, box_h) * 0.18))
+
+    text = markup.inside_label.upper()
+    text_color = Color(
+        markup.stroke_color[0] * 0.5,
+        markup.stroke_color[1] * 0.5,
+        markup.stroke_color[2] * 0.5,
+        alpha=0.95,
+    )
 
     c.saveState()
-    c.translate(lx, ly)
-    c.rotate(angle)
-
-    # Room name
-    c.setFont(LABEL_FONT, label_fs)
-    stroke_rgb = bubble.stroke_color
-    # Dark version of stroke for readable text
-    text_color = Color(
-        stroke_rgb[0] * 0.55,
-        stroke_rgb[1] * 0.55,
-        stroke_rgb[2] * 0.55,
-        alpha=0.92,
-    )
+    c.translate(cx, cy)
+    c.rotate(plan_angle_deg)
+    c.setFont("Helvetica-Bold", fs)
     c.setFillColor(text_color)
-    c.setStrokeColor(text_color)
+    tw = c.stringWidth(text, "Helvetica-Bold", fs)
+    c.drawString(-tw / 2, -fs / 3, text)
+    c.restoreState()
 
-    label_text = bubble.room_name.upper()
-    tw = c.stringWidth(label_text, LABEL_FONT, label_fs)
 
-    # Slight offset up if note present
-    y_offset = note_fs * 0.7 if bubble.note else 0
+def _draw_leader_and_callout(
+    c: canvas.Canvas,
+    markup: RoomMarkup,
+    plan_angle_deg: float,
+):
+    """
+    Draw a leader line from room edge toward callout direction,
+    then the callout text at the end.
+    """
+    if not markup.bbox:
+        return
 
-    c.drawString(-tw / 2, y_offset, label_text)
+    x0, y0, x1, y1 = markup.bbox
+    cx = (x0 + x1) / 2
+    cy = (y0 + y1) / 2
 
-    # Note text
-    if bubble.note:
-        c.setFont(NOTE_FONT, note_fs)
-        note_color = Color(
-            stroke_rgb[0] * 0.45,
-            stroke_rgb[1] * 0.45,
-            stroke_rgb[2] * 0.45,
-            alpha=0.75,
-        )
-        c.setFillColor(note_color)
-        nw = c.stringWidth(bubble.note, NOTE_FONT, note_fs)
-        c.drawString(-nw / 2, y_offset - label_fs * 1.2, bubble.note)
+    # Leader line start: edge of bbox in callout direction
+    dx, dy = markup.callout_dx, markup.callout_dy
+
+    # Start point on bbox edge
+    if dx > 0:
+        lx0 = x1
+    elif dx < 0:
+        lx0 = x0
+    else:
+        lx0 = cx
+
+    if dy > 0:
+        ly0 = y1
+    elif dy < 0:
+        ly0 = y0
+    else:
+        ly0 = cy
+
+    # End point
+    lx1 = lx0 + dx
+    ly1 = ly0 + dy
+
+    stroke = Color(*markup.stroke_color, alpha=0.90)
+    dot_fill = Color(*markup.fill_color, alpha=0.95)
+
+    c.saveState()
+
+    # Leader line
+    c.setStrokeColor(stroke)
+    c.setLineWidth(0.8)
+    c.line(lx0, ly0, lx1, ly1)
+
+    # Dot at start
+    c.setFillColor(dot_fill)
+    c.circle(lx0, ly0, 2.5, fill=1, stroke=0)
+
+    # Callout text
+    callout = markup.callout_text.upper()
+    fs = 7.0
+    c.setFont("Helvetica-Bold", fs)
+    c.setFillColor(stroke)
+    tw = c.stringWidth(callout, "Helvetica-Bold", fs)
+
+    # Position text at end of leader, offset so it doesn't overlap line
+    if dx > 0:
+        tx = lx1 + 3
+        c.drawString(tx, ly1 - fs / 3, callout)
+    elif dx < 0:
+        tx = lx1 - tw - 3
+        c.drawString(tx, ly1 - fs / 3, callout)
+    else:
+        # Vertical leader — center text
+        tx = lx1 - tw / 2
+        if dy > 0:
+            c.drawString(tx, ly1 + 3, callout)
+        else:
+            c.drawString(tx, ly1 - fs - 3, callout)
 
     c.restoreState()
 
 
 def _draw_legend(
     c: canvas.Canvas,
-    proposal: ReconfigurationProposal,
+    proposal: MarkupProposal,
     page_width: float,
     page_height: float,
 ):
-    """
-    Draw a compact legend panel in the bottom-right corner of the page.
-    Lists each bubble room type with its color swatch.
-    """
-    if not proposal.bubbles:
+    """Compact legend in bottom-right showing change type color swatches."""
+    from core.layout_engine import CHANGE_COLORS
+
+    # Deduplicate change types used
+    used_types = list(dict.fromkeys(m.change_type for m in proposal.markups))
+    if not used_types:
         return
 
-    # Deduplicate by room_type
-    seen = {}
-    for b in proposal.bubbles:
-        if b.room_type not in seen:
-            seen[b.room_type] = b
+    entry_h = 12.0
+    pad = 7.0
+    swatch = 8.0
+    legend_w = 130.0
+    legend_h = pad * 2 + len(used_types) * entry_h + 16
 
-    entries = list(seen.values())
-    entry_h = 13.0
-    pad = 8.0
-    swatch_size = 8.0
-    legend_w = 140.0
-    legend_h = pad * 2 + len(entries) * entry_h + 18
+    lx = page_width - legend_w - 10
+    ly = 10.0
 
-    # Position: bottom-right margin
-    lx = page_width - legend_w - 12
-    ly = 12.0
-
-    # Background panel
     c.saveState()
-    bg = Color(1, 1, 1, alpha=0.82)
-    border = Color(0.7, 0.7, 0.7, alpha=0.6)
-    c.setFillColor(bg)
-    c.setStrokeColor(border)
-    c.setLineWidth(0.5)
-    c.roundRect(lx, ly, legend_w, legend_h, 4, fill=1, stroke=1)
-
-    # Title
-    c.setFont("Helvetica-Bold", 7.5)
-    title_color = Color(0.25, 0.25, 0.25, alpha=0.9)
-    c.setFillColor(title_color)
-    c.drawString(lx + pad, ly + legend_h - pad - 8, "RECONFIGURATION DIAGRAM")
-
-    # Divider
-    c.setStrokeColor(Color(0.8, 0.8, 0.8, alpha=0.7))
+    c.setFillColor(Color(1, 1, 1, alpha=0.85))
+    c.setStrokeColor(Color(0.7, 0.7, 0.7, alpha=0.6))
     c.setLineWidth(0.4)
-    c.line(lx + pad, ly + legend_h - pad - 12,
-           lx + legend_w - pad, ly + legend_h - pad - 12)
+    c.roundRect(lx, ly, legend_w, legend_h, 3, fill=1, stroke=1)
 
-    # Entries
-    for i, bubble in enumerate(entries):
-        ey = ly + legend_h - pad - 22 - i * entry_h
-        # Swatch
-        fill_c = Color(*bubble.fill_color, alpha=0.55)
-        stroke_c = Color(*bubble.stroke_color, alpha=0.85)
-        c.setFillColor(fill_c)
-        c.setStrokeColor(stroke_c)
-        c.setLineWidth(0.8)
-        c.rect(lx + pad, ey, swatch_size, swatch_size, fill=1, stroke=1)
-        # Label
-        c.setFont(LEGEND_FONT, 7.0)
+    c.setFont("Helvetica-Bold", 7.0)
+    c.setFillColor(Color(0.2, 0.2, 0.2, alpha=0.9))
+    c.drawString(lx + pad, ly + legend_h - pad - 7, "MARKUP LEGEND")
+
+    c.setStrokeColor(Color(0.8, 0.8, 0.8, alpha=0.6))
+    c.setLineWidth(0.3)
+    c.line(lx + pad, ly + legend_h - pad - 11,
+           lx + legend_w - pad, ly + legend_h - pad - 11)
+
+    for i, ct in enumerate(used_types):
+        colors = CHANGE_COLORS.get(ct, CHANGE_COLORS["default"])
+        fill_rgb, stroke_rgb = colors[0], colors[1]
+        ey = ly + legend_h - pad - 20 - i * entry_h
+
+        c.setFillColor(Color(*fill_rgb, alpha=0.55))
+        c.setStrokeColor(Color(*stroke_rgb, alpha=0.85))
+        c.setLineWidth(0.7)
+        c.rect(lx + pad, ey, swatch, swatch, fill=1, stroke=1)
+
+        c.setFont("Helvetica", 6.5)
         c.setFillColor(Color(0.2, 0.2, 0.2, alpha=0.9))
-        display_name = bubble.room_name.upper()
-        c.drawString(lx + pad + swatch_size + 5, ey + 1, display_name)
+        c.drawString(lx + pad + swatch + 4, ey + 1.5, ct.upper())
 
     c.restoreState()
 
 
-def _draw_summary_header(
+def _draw_header_banner(
     c: canvas.Canvas,
-    proposal: ReconfigurationProposal,
+    proposal: MarkupProposal,
     page_width: float,
     page_height: float,
 ):
-    """
-    Draw a small summary banner at the top of the page.
-    """
-    banner_h = 22.0
-    by = page_height - banner_h
+    """Terra teal header strip at top of page."""
+    bh = 20.0
+    by = page_height - bh
 
     c.saveState()
-    bg = Color(0.059, 0.314, 0.255, alpha=0.88)   # Terra teal
-    c.setFillColor(bg)
-    c.rect(0, by, page_width, banner_h, fill=1, stroke=0)
+    c.setFillColor(Color(0.059, 0.314, 0.255, alpha=0.90))
+    c.rect(0, by, page_width, bh, fill=1, stroke=0)
 
     c.setFont("Helvetica-Bold", 7.5)
     c.setFillColor(Color(1, 1, 1, alpha=0.95))
-    c.drawString(10, by + 8, "TERRA — SCHEMATIC RECONFIGURATION PROPOSAL")
+    c.drawString(10, by + 7, "TERRA — SCHEMATIC MARKUP")
 
-    # Summary text truncated to fit
-    summary_short = proposal.summary[:140] + "…" if len(proposal.summary) > 140 else proposal.summary
-    c.setFont("Helvetica", 6.5)
-    c.setFillColor(Color(1, 1, 1, alpha=0.78))
+    summary_short = proposal.summary[:150] + "…" if len(proposal.summary) > 150 else proposal.summary
+    c.setFont("Helvetica", 6.0)
+    c.setFillColor(Color(1, 1, 1, alpha=0.75))
     c.drawString(10, by + 1, summary_short)
-
     c.restoreState()
 
 
 # ─── Main Renderer ────────────────────────────────────────────────────────────
 
-def render_bubble_overlay(
+def render_markup_overlay(
     original_pdf_bytes: bytes,
-    proposal: ReconfigurationProposal,
+    proposal: MarkupProposal,
     page_index: int = 0,
     page_height_pts: Optional[float] = None,
     page_width_pts: Optional[float] = None,
 ) -> bytes:
     """
-    Render bubble diagram overlay onto original PDF page.
-
-    Args:
-        original_pdf_bytes: Raw bytes of the source vector PDF
-        proposal: ReconfigurationProposal from layout_engine.py
-        page_index: Which page to overlay (0-based)
-        page_height_pts: Page height in PDF points (from parser)
-        page_width_pts: Page width in PDF points (from parser)
-
-    Returns:
-        Bytes of the new PDF with bubble overlay baked in
+    Render room markup overlay onto original PDF page.
+    Returns bytes of the new marked-up PDF.
     """
-    # ── Read original PDF ──────────────────────────────────────────────────
     original_reader = PdfReader(io.BytesIO(original_pdf_bytes))
     original_page = original_reader.pages[page_index]
 
-    # Get page dimensions from original if not provided
     if page_width_pts is None or page_height_pts is None:
         media_box = original_page.mediabox
         page_width_pts = float(media_box.width)
@@ -277,57 +265,40 @@ def render_bubble_overlay(
     pw = page_width_pts
     ph = page_height_pts
 
-    # ── Build overlay PDF in memory ────────────────────────────────────────
     overlay_buffer = io.BytesIO()
     c = canvas.Canvas(overlay_buffer, pagesize=(pw, ph))
 
-    # Draw each bubble polygon
-    for bubble in proposal.bubbles:
-        _draw_angular_polygon(
-            c,
-            bubble.points,
-            fill_rgb=bubble.fill_color,
-            fill_opacity=bubble.fill_opacity,
-            stroke_rgb=bubble.stroke_color,
-            stroke_opacity=0.88,
-            stroke_width=1.5,
-        )
+    # Draw fills first (bottom layer)
+    for markup in proposal.markups:
+        _draw_room_fill(c, markup)
 
-    # Draw labels on top of all fills
-    for bubble in proposal.bubbles:
-        _draw_bubble_label(c, bubble, ph)
+    # Draw inside labels
+    for markup in proposal.markups:
+        _draw_inside_label(c, markup, proposal.plan_angle_deg)
 
-    # Draw legend
+    # Draw leader lines + callout text on top
+    for markup in proposal.markups:
+        _draw_leader_and_callout(c, markup, proposal.plan_angle_deg)
+
+    # Legend and header
     _draw_legend(c, proposal, pw, ph)
-
-    # Draw summary banner
-    _draw_summary_header(c, proposal, pw, ph)
+    _draw_header_banner(c, proposal, pw, ph)
 
     c.save()
     overlay_buffer.seek(0)
 
-    # ── Merge overlay onto original ────────────────────────────────────────
     overlay_reader = PdfReader(overlay_buffer)
     overlay_page = overlay_reader.pages[0]
-
-    # Merge: original stays as base, overlay drawn on top
     original_page.merge_page(overlay_page)
 
-    # ── Build output PDF ───────────────────────────────────────────────────
     writer = PdfWriter()
-
-    # Add all pages; only the selected page gets the overlay
     for i, page in enumerate(original_reader.pages):
-        if i == page_index:
-            writer.add_page(original_page)
-        else:
-            writer.add_page(page)
+        writer.add_page(original_page if i == page_index else page)
 
-    # Preserve metadata
     writer.add_metadata({
         "/Creator": "Terra Unit Plan Reviewer",
-        "/Producer": "Terra — Bubble Diagram Engine v1",
-        "/Subject": f"Schematic Reconfiguration — {proposal.summary[:80]}",
+        "/Producer": "Terra — Schematic Markup Engine v2",
+        "/Subject": proposal.summary[:80],
     })
 
     out_buffer = io.BytesIO()
