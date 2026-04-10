@@ -3,46 +3,47 @@ core/layout_engine.py
 ---------------------
 Step 2: AI Layout Engine
 
-Claude analyzes the plan image + parsed geometry and returns two kinds of markups:
+Two markup types:
 
-  RECONFIGURE markups  (change_type: enlarge | relocate | reconfigure | add | remove | swap)
-    -> Colored semi-transparent bubble drawn over the room
-    -> Colored leader line + callout text routed OUTSIDE the plan boundary
-    -> Appear on Sheet 1 (annotated plan) and Sheet 2 (reconfiguration study)
+  RECONFIGURE  (change_type: enlarge | relocate | reconfigure | add | remove | swap)
+    Sheet 1: connector line + text only (NO bubble fill)
+    Sheet 2: bubble fill only (NO connector lines or text)
 
-  COMMENT markups  (change_type: comment)
-    -> NO bubble fill — red leader line and red callout text only
-    -> Leader line routes OUTSIDE the plan boundary
-    -> Appear on Sheet 1 only
+  COMMENT  (change_type: comment)
+    Sheet 1: red connector line + red text only
+    Sheet 2: not shown
+
+All callout endpoints are placed in the SHEET MARGIN ZONES — the white space
+between the unit floor plan and the drawing border/title block. The AI picks
+which margin zone (top/bottom/left/right) has the most open space, and the
+routing clips the endpoint so it always stays within the printed page.
 """
 
 import json
-import math
 import re
 import httpx
 from dataclasses import dataclass, field
 from typing import Optional
 
-from core.parser import PlanGeometry, RoomZone
+from core.parser import PlanGeometry
 
 
 # ---- Data Structures ---------------------------------------------------------
 
 @dataclass
 class RoomMarkup:
-    """A single room markup: either a reconfigure bubble or a comment annotation."""
     room_name: str
-    change_type: str        # enlarge | relocate | reconfigure | add | remove | swap | comment
+    change_type: str        # enlarge|relocate|reconfigure|add|remove|swap|comment
     fill_color: tuple
     fill_opacity: float
     stroke_color: tuple
-    inside_label: str       # short text inside bubble (reconfigure only)
-    callout_text: str       # outside callout text
-    is_comment: bool = False        # True -> red text/line only, no bubble
-    bbox: Optional[tuple] = None    # (x0, y0, x1, y1) PDF pts
+    inside_label: str
+    callout_text: str
+    is_comment: bool = False
+    bbox: Optional[tuple] = None    # (x0, y0, x1, y1) PDF pts — room location
     cx: float = 0.0
     cy: float = 0.0
-    # Leader line start (on room bbox edge) and end (outside plan boundary)
+    # Leader: start on room bbox edge, end in sheet margin
     leader_x0: float = 0.0
     leader_y0: float = 0.0
     callout_x: float = 0.0
@@ -55,66 +56,59 @@ class MarkupProposal:
     summary: str
     markups: list[RoomMarkup] = field(default_factory=list)
     plan_angle_deg: float = 0.0
-    plan_bbox: tuple = (0, 0, 612, 792)   # (x0, y0, x1, y1) of drawing area
+    plan_bbox: tuple = (0, 0, 612, 792)
 
 
-# ---- Change Type Color Palette -----------------------------------------------
+# ---- Color palette -----------------------------------------------------------
 
 CHANGE_COLORS = {
-    "enlarge":     ((0.0,  0.52, 0.78), (0.0,  0.38, 0.65)),   # blue
-    "relocate":    ((0.93, 0.42, 0.01), (0.80, 0.30, 0.0)),    # orange
-    "reconfigure": ((0.04, 0.55, 0.40), (0.02, 0.40, 0.28)),   # teal
-    "add":         ((0.20, 0.65, 0.20), (0.10, 0.50, 0.10)),   # green
-    "remove":      ((0.78, 0.15, 0.15), (0.65, 0.05, 0.05)),   # red-fill
-    "swap":        ((0.55, 0.20, 0.70), (0.40, 0.10, 0.55)),   # purple
-    "comment":     ((0.82, 0.08, 0.08), (0.72, 0.04, 0.04)),   # red (unused for fill)
+    "enlarge":     ((0.0,  0.52, 0.78), (0.0,  0.38, 0.65)),
+    "relocate":    ((0.93, 0.42, 0.01), (0.80, 0.30, 0.0)),
+    "reconfigure": ((0.04, 0.55, 0.40), (0.02, 0.40, 0.28)),
+    "add":         ((0.20, 0.65, 0.20), (0.10, 0.50, 0.10)),
+    "remove":      ((0.78, 0.15, 0.15), (0.65, 0.05, 0.05)),
+    "swap":        ((0.55, 0.20, 0.70), (0.40, 0.10, 0.55)),
+    "comment":     ((0.82, 0.08, 0.08), (0.72, 0.04, 0.04)),
     "default":     ((0.25, 0.25, 0.25), (0.15, 0.15, 0.15)),
 }
 
-FILL_OPACITY = 0.28
-COMMENT_RED  = (0.82, 0.08, 0.08)   # unified red for comment lines/text
-
+FILL_OPACITY    = 0.28
+COMMENT_RED     = (0.82, 0.08, 0.08)
 RECONFIGURE_TYPES = {"enlarge", "relocate", "reconfigure", "add", "remove", "swap"}
 
 
 def _get_change_colors(change_type: str):
-    entry = CHANGE_COLORS.get(change_type.lower(), CHANGE_COLORS["default"])
-    return entry[0], entry[1]
+    return CHANGE_COLORS.get(change_type.lower(), CHANGE_COLORS["default"])
 
 
 # ---- System Prompt -----------------------------------------------------------
 
-MARKUP_SYSTEM_PROMPT = """You are a senior architect and development advisor for Terra, a Miami-based luxury real estate developer. You are reviewing a unit floor plan and producing a schematic markup showing recommended improvements.
+MARKUP_SYSTEM_PROMPT = """You are a senior architect and development advisor for Terra, a Miami-based luxury real estate developer. You are reviewing a unit floor plan and producing a schematic markup.
 
 [TERRA PROJECT-SPECIFIC RECONFIGURATION STANDARDS - INSERT HERE BEFORE DEPLOYMENT]
 
-Your task: analyze ALL rooms in the plan and identify every room that could be improved.
-
-You must classify each markup as one of two types:
+Classify every markup as one of two types:
 
 TYPE 1 - RECONFIGURE (change_type: enlarge | relocate | reconfigure | add | remove | swap)
-  Use ONLY when you are recommending a specific physical layout change: resize a room, move it,
-  add a missing element, remove something, or swap two rooms.
-  These will be drawn as colored bubble diagrams overlaid on the room.
+  A specific physical layout change. Will show as a bubble diagram on the reconfiguration sheet.
+  On the annotated plan sheet it appears as a connector line + text only (no fill).
 
 TYPE 2 - COMMENT (change_type: comment)
-  Use for any concern, observation, or verification note that does NOT require a specific physical
-  reconfiguration. Examples: "VERIFY EGRESS WINDOW SIZE", "CONFIRM ACOUSTIC SEPARATION",
-  "CHECK CLEARANCE AT ENTRY", "REVIEW BALCONY DEPTH".
-  These will be drawn as red annotation lines with NO bubble — just a red leader line and red text.
+  An observation, concern, or verification note. Red connector line + red text only. No bubble ever.
 
-For EVERY room that could be improved, return a markup entry with:
-- room_name: EXACT name as it appears in the geometry data
-- change_type: one of the values above
-- inside_label: short room name for bubble label (used on reconfigure types only)
-- callout_text: specific, uppercase, actionable note (max ~8 words)
-- callout_side: "top" | "bottom" | "left" | "right"
-  Choose the side of the OVERALL PLAN that has the most open margin space.
-  Actively spread callouts across all four sides to avoid crowding any one side.
+Rules for callout_side:
+  Look at the OVERALL DRAWING SHEET. The floor plan sits somewhere on it, surrounded by white margin
+  space on all sides (and a title block at the bottom). Assign callout_side based on which margin
+  zone around the unit has clear space for this annotation:
+  - "top"    = white space above the unit on the sheet
+  - "bottom" = white space below the unit (above title block)
+  - "left"   = white space to the left of the unit
+  - "right"  = white space to the right of the unit (key plan area counts as occupied)
+  Spread callouts across all four sides. Never put more than 4-5 on the same side.
 
-Respond ONLY with valid JSON, no preamble or markdown:
+Respond ONLY with valid JSON:
 {
-  "summary": "2-3 sentence overall assessment",
+  "summary": "2-3 sentence assessment",
   "markups": [
     {
       "room_name": "BEDROOM 1",
@@ -122,72 +116,69 @@ Respond ONLY with valid JSON, no preamble or markdown:
       "inside_label": "BEDROOM 1",
       "callout_text": "INCREASE TO MIN 11FT CLEAR",
       "callout_side": "top"
-    },
-    {
-      "room_name": "MASTER BATHROOM",
-      "change_type": "comment",
-      "inside_label": "",
-      "callout_text": "VERIFY SOAKING TUB CLEARANCE",
-      "callout_side": "right"
     }
   ]
-}
-
-Be thorough. Spread callouts across all four plan edges. Focus on luxury residential quality."""
+}"""
 
 
-# ---- Callout Routing ---------------------------------------------------------
+# ---- Callout routing: endpoint in sheet margin, never off-page ---------------
 
-MARGIN_OUTSIDE = 52.0    # pts of clearance beyond plan bbox edge
-HEADER_RESERVE = 22.0    # pts to keep clear at top for the header banner
-FOOTER_RESERVE = 14.0    # pts to keep clear at bottom
+# How far into the margin to place the callout endpoint (from plan bbox edge)
+MARGIN_DEPTH = 45.0
+
+# Safe insets from page edges (pts) — keeps text away from crop marks / binding
+PAGE_INSET_H = 14.0   # horizontal
+PAGE_INSET_V = 24.0   # vertical (top: clears header banner; bottom: clears title block)
+TITLE_BLOCK_H = 55.0  # estimated height of title block at bottom of sheet
 
 
 def _route_callout(
-    room_cx: float,
-    room_cy: float,
+    room_cx: float, room_cy: float,
     room_bbox: tuple,
     callout_side: str,
     plan_bbox: tuple,
-    page_width: float,
-    page_height: float,
+    page_width: float, page_height: float,
 ) -> tuple:
     """
     Returns (lx0, ly0, lx1, ly1):
-      lx0/ly0 = leader line start on the room bbox edge
-      lx1/ly1 = callout endpoint placed OUTSIDE the plan bounding box
+      lx0/ly0 = leader start, on the room bbox edge facing callout_side
+      lx1/ly1 = callout endpoint, in the sheet margin on that side
 
-    The endpoint is always beyond plan_bbox by MARGIN_OUTSIDE pts on the
-    requested side, keeping the text in the page margin area.
+    Endpoint is clamped so it stays within the printable area of the sheet.
     """
     px0, py0, px1, py1 = plan_bbox
     rx0, ry0, rx1, ry1 = room_bbox
 
+    # Safe page bounds (avoids header at top, title block at bottom, crop at sides)
+    safe_x0 = PAGE_INSET_H
+    safe_x1 = page_width - PAGE_INSET_H
+    safe_y0 = TITLE_BLOCK_H
+    safe_y1 = page_height - PAGE_INSET_V
+
+    def cx(v): return max(safe_x0, min(safe_x1, v))
+    def cy(v): return max(safe_y0, min(safe_y1, v))
+
     if callout_side == "top":
         lx0, ly0 = room_cx, ry1
-        lx1 = _clamp(room_cx, 10, page_width - 10)
-        ly1 = min(py1 + MARGIN_OUTSIDE, page_height - HEADER_RESERVE - 4)
+        lx1 = cx(room_cx)
+        ly1 = cy(py1 + MARGIN_DEPTH)
     elif callout_side == "bottom":
         lx0, ly0 = room_cx, ry0
-        lx1 = _clamp(room_cx, 10, page_width - 10)
-        ly1 = max(py0 - MARGIN_OUTSIDE, FOOTER_RESERVE + 4)
+        lx1 = cx(room_cx)
+        ly1 = cy(py0 - MARGIN_DEPTH)
     elif callout_side == "left":
         lx0, ly0 = rx0, room_cy
-        lx1 = max(px0 - MARGIN_OUTSIDE, 10)
-        ly1 = _clamp(room_cy, FOOTER_RESERVE, page_height - HEADER_RESERVE)
+        lx1 = cx(px0 - MARGIN_DEPTH)
+        ly1 = cy(room_cy)
     else:  # right
         lx0, ly0 = rx1, room_cy
-        lx1 = min(px1 + MARGIN_OUTSIDE, page_width - 10)
-        ly1 = _clamp(room_cy, FOOTER_RESERVE, page_height - HEADER_RESERVE)
+        lx1 = cx(px1 + MARGIN_DEPTH)
+        ly1 = cy(room_cy)
 
     return lx0, ly0, lx1, ly1
 
 
-def _clamp(val: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, val))
-
-
-# ---- Geometry context builder ------------------------------------------------
+# ---- API helpers -------------------------------------------------------------
 
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL   = "claude-sonnet-4-20250514"
@@ -196,8 +187,12 @@ CLAUDE_MODEL   = "claude-sonnet-4-20250514"
 def _geometry_to_context(geo: PlanGeometry) -> str:
     lines = [
         f"PAGE: {geo.page_width:.1f} x {geo.page_height:.1f} pts",
-        f"PLAN_BBOX: x0={geo.plan_bbox[0]:.0f} y0={geo.plan_bbox[1]:.0f} "
+        f"PLAN_BBOX (unit drawing area): x0={geo.plan_bbox[0]:.0f} y0={geo.plan_bbox[1]:.0f} "
         f"x1={geo.plan_bbox[2]:.0f} y1={geo.plan_bbox[3]:.0f}",
+        f"  -> margin zones: top={geo.page_height - geo.plan_bbox[3]:.0f}pts  "
+        f"bottom={geo.plan_bbox[1]:.0f}pts  "
+        f"left={geo.plan_bbox[0]:.0f}pts  "
+        f"right={geo.page_width - geo.plan_bbox[2]:.0f}pts",
         f"PLAN_ANGLE_DEG: {geo.plan_angle_deg:.1f}",
         f"UNIT_TYPE: {geo.unit_type or 'Unknown'}",
         f"UNIT_AREA_SQFT: {geo.unit_area_sqft or 'Unknown'}",
@@ -222,40 +217,28 @@ async def generate_markups(
     unit_label: str = "",
     custom_system_prompt: Optional[str] = None,
 ) -> MarkupProposal:
-    """
-    Call Claude API -> get room markup proposals -> match to parsed geometry
-    -> route all callout endpoints outside the plan boundary.
-    Returns MarkupProposal with fully populated RoomMarkup objects.
-    """
     system  = custom_system_prompt or MARKUP_SYSTEM_PROMPT
     context = _geometry_to_context(geo)
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": plan_image_b64,
-                    },
-                },
-                {
-                    "type": "text",
-                    "text": (
-                        f"Unit type: {unit_label}\n\n"
-                        f"GEOMETRY DATA:\n{context}\n\n"
-                        "Classify each markup as 'reconfigure' type (physical layout change -> bubble) "
-                        "or 'comment' type (observation/note -> red text line only, NO bubble). "
-                        "Spread callout_side across all four plan edges to avoid crowding. "
-                        "Use EXACT room names from geometry data. Return JSON only."
-                    ),
-                },
-            ],
-        }
-    ]
+    messages = [{
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": plan_image_b64},
+            },
+            {
+                "type": "text",
+                "text": (
+                    f"Unit type: {unit_label}\n\n"
+                    f"GEOMETRY DATA:\n{context}\n\n"
+                    "Use EXACT room names from geometry data. "
+                    "Spread callout_side across all four sides. "
+                    "Return JSON only."
+                ),
+            },
+        ],
+    }]
 
     async with httpx.AsyncClient(timeout=90.0) as client:
         resp = await client.post(
@@ -265,20 +248,12 @@ async def generate_markups(
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={
-                "model": CLAUDE_MODEL,
-                "max_tokens": 2000,
-                "system": system,
-                "messages": messages,
-            },
+            json={"model": CLAUDE_MODEL, "max_tokens": 2000, "system": system, "messages": messages},
         )
         resp.raise_for_status()
         data = resp.json()
 
-    raw = "".join(
-        block.get("text", "") for block in data.get("content", [])
-        if block.get("type") == "text"
-    )
+    raw = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     raw = re.sub(r"```json|```", "", raw).strip()
 
     try:
@@ -286,9 +261,8 @@ async def generate_markups(
     except json.JSONDecodeError as e:
         raise ValueError(f"Claude returned invalid JSON: {e}\nRaw: {raw[:500]}")
 
-    # ---- Match markups to parsed geometry ------------------------------------
-    markups: list[RoomMarkup] = []
     room_lookup = {r.name.upper().strip(): r for r in geo.rooms}
+    markups: list[RoomMarkup] = []
 
     for item in result.get("markups", []):
         room_name    = item.get("room_name", "").strip()
@@ -297,28 +271,24 @@ async def generate_markups(
         callout_text = item.get("callout_text", "")
         callout_side = item.get("callout_side", "top")
 
-        is_comment  = (change_type == "comment")
+        is_comment = (change_type == "comment")
         fill_rgb, stroke_rgb = _get_change_colors(change_type)
 
-        # Exact match first, then fuzzy
         parsed = room_lookup.get(room_name.upper())
         if not parsed:
             for key, r in room_lookup.items():
                 if any(w in key for w in room_name.upper().split() if len(w) > 2):
                     parsed = r
                     break
-
         if not parsed:
             continue
 
         lx0, ly0, lx1, ly1 = _route_callout(
-            room_cx=parsed.cx,
-            room_cy=parsed.cy,
+            room_cx=parsed.cx, room_cy=parsed.cy,
             room_bbox=parsed.bbox,
             callout_side=callout_side,
             plan_bbox=geo.plan_bbox,
-            page_width=geo.page_width,
-            page_height=geo.page_height,
+            page_width=geo.page_width, page_height=geo.page_height,
         )
 
         markups.append(RoomMarkup(
@@ -331,12 +301,9 @@ async def generate_markups(
             callout_text=callout_text,
             is_comment=is_comment,
             bbox=parsed.bbox,
-            cx=parsed.cx,
-            cy=parsed.cy,
-            leader_x0=lx0,
-            leader_y0=ly0,
-            callout_x=lx1,
-            callout_y=ly1,
+            cx=parsed.cx, cy=parsed.cy,
+            leader_x0=lx0, leader_y0=ly0,
+            callout_x=lx1, callout_y=ly1,
             callout_side=callout_side,
         ))
 
